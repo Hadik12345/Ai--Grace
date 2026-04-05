@@ -149,6 +149,19 @@ def stop_alarm_sound():
         stop_dialog.destroy()
         stop_dialog = None
 
+def set_alarm_volume(volume_level: float):
+    """Sets the playback volume for the alarm sound."""
+    if SOUND_INITIALIZED:
+        try:
+            # Pygame volume is a float between 0.0 and 1.0
+            pygame.mixer.music.set_volume(volume_level)
+            print(f"Volume set to {volume_level * 100:.0f}%")
+        except Exception as e:
+            logging.error(f"Error setting volume: {e}", exc_info=True)
+            print(f"Error setting volume: {e}")
+    else:
+        print("Sound system not initialized. Cannot set volume.")
+
 #-------------- End of Sound Functions -------------
 
 
@@ -284,6 +297,28 @@ def request_stop_alarm_sound() -> bool:
         print(f"[Alarm Request] Error queuing 'stop_sound' command: {e}")
         return False
 
+def request_set_volume(volume_level: float) -> bool:
+    """
+    Puts a 'volume' command onto the message queue to remotely control sound volume.
+
+    Args:
+        volume_level: The desired volume level (0.0 to 1.0).
+
+    Returns:
+        True if the request was successfully queued, False otherwise.
+    """
+    try:
+        if not isinstance(volume_level, (int, float)) or not (0.0 <= volume_level <= 1.0):
+             print("[Alarm Request] Invalid volume level. Must be between 0.0 and 1.0.")
+             return False
+        command_line = f"volume {float(volume_level)}"
+        message_queue.put({"type": "command", "line": command_line})
+        return True
+    except Exception as e:
+        logging.error(f"[Alarm Request] Error queuing 'volume' command: {e}", exc_info=True)
+        print(f"[Alarm Request] Error queuing 'volume' command: {e}")
+        return False
+
 # --- Background Threads ---
 
 def alarm_checker():
@@ -329,7 +364,7 @@ def cli_input_handler():
     (Can be disabled if only external control is needed)
     """
     print("\n--- Alarm Manager CLI (Runs in Background) ---")
-    print("Commands: add HH:MM | list | delete <ID> | exit")
+    print("Commands: add HH:MM | list | delete <ID> | volume <0.0-1.0> | stop_sound | exit")
     print("----------------------------------------------\n")
 
     while True:
@@ -485,6 +520,16 @@ def handle_command(command_line: str):
         stop_alarm_sound()
         print("✅ Alarm sound stopped via command.")
 
+    elif command == "volume" and len(parts) == 2:
+        try:
+            vol = float(parts[1])
+            if 0.0 <= vol <= 1.0:
+                set_alarm_volume(vol)
+            else:
+                print("Error: Volume must be between 0.0 and 1.0.")
+        except ValueError:
+            print("Error: Invalid volume format. Please provide a number between 0.0 and 1.0.")
+
     elif command == "exit" and len(parts) == 1:
         print("Exit command received. Shutting down Alarm Manager...")
         stop_alarm_sound() # Stop sound if playing
@@ -509,7 +554,7 @@ def handle_command(command_line: str):
         tk_root = None # Ensure it's marked as None
 
     else:
-        print(f"Unknown command received: '{command_line}'. Use 'add HH:MM', 'list', 'delete <ID>', or 'exit'.")
+        print(f"Unknown command received: '{command_line}'. Use 'add HH:MM', 'list', 'delete <ID>', 'volume <0.0-1.0>', 'stop_sound', or 'exit'.")
 
 
 # --- Main Application Entry Point ---
