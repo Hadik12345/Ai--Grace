@@ -1,4 +1,4 @@
-
+# Copyright 2023-2024 Deepgram SDK contributors. All Rights Reserved.
 # Use of this source code is governed by a MIT license that can be found in the LICENSE file.
 # SPDX-License-Identifier: MIT
 import os
@@ -140,7 +140,7 @@ def main():
         # --- /Configure Deepgram Client ---
 
 
-        dg_connection = deepgram.listen.websocket.v("2")
+        dg_connection = deepgram.listen.websocket.v("1")
 
         # --- Event Handlers (on_open, on_message, etc.) ---
         # (Your existing event handlers remain the same)
@@ -157,9 +157,6 @@ def main():
                 if hasattr(result, 'type') and result.type == 'KeepAlive':
                      print("(KeepAlive message received from Deepgram)")
                      return
-                # Also ignore EagerEndOfTurn, TurnResumed, EndOfTurn explicitly to avoid spam
-                if hasattr(result, 'type') and result.type in ['EagerEndOfTurn', 'TurnResumed', 'EndOfTurn', 'SpeechStarted']:
-                     return
                 print(f"Warning: Received unexpected message format: {result.to_json()}")
                 return
 
@@ -175,7 +172,7 @@ def main():
                     is_finals = []
                     pause_sending()  # Pause sending audio after final result
                     llm_processing = True # Set flag to indicate LLM processing is in progress
-                    brain.main(utterance)  # Call the main function from brain.py with the final result
+                    #brain.main(utterance)  # Call the main function from brain.py with the final result
                     llm_processing = False
                 else:
                     print(f"Is Final: {sentence}")
@@ -188,27 +185,18 @@ def main():
         def on_speech_started(self, speech_started, **kwargs):
             print("--- Speech Started ---")
 
-        def on_eager_eot(self, eager_eot, **kwargs):
-            print("--- Eager End of Turn Detected ---")
-            # We could start preprocessing / prompting the LLM early here 
-
-        def on_turn_resumed(self, turn_resumed, **kwargs):
-            print("--- Turn Resumed (user continued speaking) ---")
-            # We would cancel our early LLM request here
-
-        def on_end_of_turn(self, eot, **kwargs):
-            print("--- End Of Turn ---")
+        def on_utterance_end(self, utterance_end, **kwargs):
+            print("--- Utterance End ---")
             global is_finals
             if len(is_finals) > 0:
                 utterance = " ".join(is_finals)
-                print(f"End of Turn Transcript: {utterance}")
+                print(f"Utterance End Transcript: {utterance}")
                 is_finals = []
                 pause_sending()
                 llm_processing = True # Set flag to indicate LLM processing is in progress
-                # Note: Assuming brain is imported somewhere 
                 brain.main(utterance)
                 llm_processing = False # Reset flag after processing
-            # Pause sending audio after end of turn
+            # Pause sending audio after utterance end
 
         def on_close(self, close, **kwargs):
             print(f"\n--- Connection Closed (Code: {close.code}, Reason: {close.reason}) ---")
@@ -225,12 +213,7 @@ def main():
         dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
         dg_connection.on(LiveTranscriptionEvents.Metadata, on_metadata)
         dg_connection.on(LiveTranscriptionEvents.SpeechStarted, on_speech_started)
-        
-        # New Events for Flux Turn-taking
-        dg_connection.on(LiveTranscriptionEvents.EagerEndOfTurn, on_eager_eot)
-        dg_connection.on(LiveTranscriptionEvents.TurnResumed, on_turn_resumed)
-        dg_connection.on(LiveTranscriptionEvents.EndOfTurn, on_end_of_turn)
-
+        dg_connection.on(LiveTranscriptionEvents.UtteranceEnd, on_utterance_end)
         dg_connection.on(LiveTranscriptionEvents.Close, on_close)
         dg_connection.on(LiveTranscriptionEvents.Error, on_error)
         dg_connection.on(LiveTranscriptionEvents.Unhandled, on_unhandled)
@@ -239,18 +222,20 @@ def main():
 
         # --- Live Transcription Options ---
         options: LiveOptions = LiveOptions(
-            model="flux-general-en",
+            model="nova-3",
+            language="multi",
             smart_format=True,
             encoding="linear16",
             channels=1,
             sample_rate=16000,
             interim_results=True,
+            utterance_end_ms="1000",
+            vad_events=True,
+            endpointing=700,
         )
 
         addons = {
-            "eot_threshold": 0.7,
-            "eager_eot_threshold": 0.5,
-            "eot_timeout_ms": 5000,
+            "no_delay": "true"
         }
         # --- /Live Transcription Options ---
 

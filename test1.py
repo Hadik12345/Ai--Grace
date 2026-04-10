@@ -250,6 +250,10 @@ def _dispatch_message(message):
     elif msg_type == "Metadata":
         print(f"[DG] Metadata: {message}")
 
+    # TurnInfo (internal state/heartbeat, safe to ignore)
+    elif msg_type == "TurnInfo":
+        pass
+
     # Unknown
     else:
         print(f"[DG] Unhandled message type: {msg_type}")
@@ -293,7 +297,7 @@ async def _run_flux_session():
         return
 
     config = {"keepalive": "true"}
-    client = AsyncDeepgramClient(api_key, config)
+    client = AsyncDeepgramClient(api_key=api_key)
 
     print("[DG] Connecting to Deepgram Flux (v2 endpoint)...")
 

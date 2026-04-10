@@ -1,144 +1,307 @@
-
-import asyncio
-import json
+# Copyright 2023-2024 Deepgram SDK contributors. All Rights Reserved.
+# Use of this source code is governed by a MIT license that can be found in the LICENSE file.
+# SPDX-License-Identifier: MIT
 import os
-from typing import Optional
-
 from dotenv import load_dotenv
-from deepgram import AsyncDeepgramClient
+from time import sleep
+import logging
+import threading # Import threading for the input loop
+
+#-----local imports-----
+
+
+from deepgram.utils import verboselogs
+
+from deepgram import (
+    DeepgramClient,
+    DeepgramClientOptions,
+    LiveTranscriptionEvents,
+    LiveOptions,
+    Microphone,
+)
 
 load_dotenv()
 
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+# --- State Variables ---
+# We will collect the is_final=true messages here
+is_finals = []
+# Control flag for sending audio data
+is_sending = True
+# Lock for thread-safe access to is_sending
+sending_lock = threading.Lock()
+# Flag to signal the input loop to stop
+stop_event = threading.Event()
+# --- /State Variables ---
+llm_processing = False # Flag to indicate if LLM processing is in progress
 
-if not DEEPGRAM_API_KEY:
-    raise ValueError("Missing DEEPGRAM_API_KEY in .env")
-
-
-current_draft_task: Optional[asyncio.Task] = None
-
-
-async def prepare_draft_response(transcript: str):
-    """Mock speculative response started on EagerEndOfTurn."""
-    print(f"\n[AGENT] Preparing speculative response for: {transcript}")
-
-    await asyncio.sleep(2)
-
-    print(f"[AGENT] Draft response ready: You said -> {transcript}")
-
-
-async def finalize_response(transcript: str):
-    """Mock final response started on EndOfTurn."""
-    print(f"\n[AGENT] Finalizing response for: {transcript}")
-
-    await asyncio.sleep(1)
-
-    print(f"[AGENT] FINAL RESPONSE: Got it, you said: {transcript}\n")
+# --- Microphone Data Handling ---
+# This wrapper function checks the is_sending flag before forwarding data
+def handle_microphone_data(chunk, dg_connection):
+    global is_sending
+    with sending_lock:
+        if is_sending:
+            dg_connection.send(chunk)
+        # else:
+            # Optional: Log or print that data is being withheld
+            # print(" Mic Paused - Data withheld")
+            # pass
 
 
-async def cancel_draft_response():
-    global current_draft_task
+# --- Control Functions ---
+def pause_sending():
+    """Stops sending audio data to Deepgram."""
+    global is_sending
+    with sending_lock:
+        if is_sending:
+            print("\n--- Pausing audio transmission ---")
+            is_sending = False
 
-    if current_draft_task and not current_draft_task.done():
-        print("\n[AGENT] User continued speaking, cancelling draft response...")
+def resume_sending():
+    """Resumes sending audio data to Deepgram."""
+    global is_sending
+    with sending_lock:
+        if not is_sending:
+            print("\n--- Resuming audio transmission ---")
+            is_sending = True
 
-        current_draft_task.cancel()
+def stop_application():
+    """Signals the application to stop."""
+    print("\n--- Stopping application ---")
+    stop_event.set() # Signal the input loop to exit
+# --- /Control Functions ---
 
+
+# --- Input Handling Thread ---
+def handle_input(microphone, dg_connection):
+    """Handles user input in a separate thread."""
+    print("\n\n--- Controls ---")
+    print("Press 'p' then Enter to pause sending audio.")
+    print("Press 'r' then Enter to resume sending audio.")
+    print("Press 'q' then Enter to quit.")
+    print("----------------\n")
+    while not stop_event.is_set():
         try:
-            await current_draft_task
-        except asyncio.CancelledError:
-            print("[AGENT] Draft response cancelled")
-
-
-async def keep_alive(connection):
-    """Deepgram closes idle sockets after ~10s without audio."""
-    while True:
-        await asyncio.sleep(3)
-        try:
-            await connection.send(json.dumps({"type": "KeepAlive"}))
-        except Exception:
+            command = input("Enter command (p/r/q): ").strip().lower()
+            if command == 'p':
+                pause_sending()
+            elif command == 'r':
+                resume_sending()
+            elif command == 'q':
+                stop_application()
+                break # Exit loop immediately on quit command
+            else:
+                print("Unknown command.")
+        except EOFError: # Handle case where input stream is closed
+            stop_application()
+            break
+        except Exception as e:
+            print(f"Error in input thread: {e}")
+            stop_application()
             break
 
+    # Ensure microphone and connection are cleaned up when loop exits
+    print("Input loop finished. Cleaning up...")
+    if microphone:
+        microphone.finish()
+    if dg_connection:
+        dg_connection.finish()
 
-async def main():
-    global current_draft_task
+# --- /Input Handling Thread ---
 
-    deepgram = AsyncDeepgramClient(api_key=DEEPGRAM_API_KEY)
 
-    # Latest Flux SDK API
-    async with deepgram.listen.v2.connect(
-        model="flux-general-en",
-        encoding="linear16",
-        sample_rate=16000,
-        eot_threshold=0.7,
-        eager_eot_threshold=0.45,
-        eot_timeout_ms=3000,
-    ) as connection:
+def main():
+    global is_finals, is_sending,llm_processing
+    dg_connection = None
+    microphone = None
+    input_thread = None
 
-        print("Connected to Deepgram Flux")
+    try:
+        # --- Configure Deepgram Client with Keepalive ---
+        # Load API Key from environment variable
+        DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+        if not DEEPGRAM_API_KEY:
+             # Fallback to the hardcoded key if the environment variable isn't set
+             # WARNING: Hardcoding keys is not recommended for production.
+             print("Warning: DEEPGRAM_API_KEY environment variable not set. Using hardcoded key.")
+             DEEPGRAM_API_KEY = "63a9ae3445f36f599a6c93a1184eec692b7d18d4" # Replace or remove if using env var
 
-            # Start keepalive background task
-        asyncio.create_task(keep_alive(connection))
+        if not DEEPGRAM_API_KEY:
+             print("Error: Deepgram API Key not found. Set DEEPGRAM_API_KEY environment variable or hardcode it.")
+             return
 
-        print("Speak into your microphone stream...")
+        # Set up client configuration with keepalive enabled
+        # The keepalive option sends pings internally to prevent timeouts during pauses.
+        config: DeepgramClientOptions = DeepgramClientOptions(
+            options={"keepalive": "true"}
+        )
 
-        while True:
-            message = await connection.recv()
+        # Initialize the Deepgram client with the API key and config
+        deepgram: DeepgramClient = DeepgramClient(DEEPGRAM_API_KEY, config)
+        # --- /Configure Deepgram Client ---
 
-            if isinstance(message, bytes):
-                continue
 
-            if not isinstance(message, dict):
-                try:
-                    message = json.loads(message)
-                except Exception:
-                    print("Unknown message:", message)
-                    continue
+        dg_connection = deepgram.listen.websocket.v("1")
 
-        msg_type = message.get("type")
+        # --- Event Handlers (on_open, on_message, etc.) ---
+        # (Your existing event handlers remain the same)
+        def on_open(self, open, **kwargs):
+            print("\n--- Connection Open ---")
+            # Add a note about keepalive being active
+            print("Keepalive enabled: Connection should stay open during pauses.")
 
-        # Regular transcript updates while user is speaking
-        if msg_type == "Update":
-            transcript = message.get("transcript", "")
-            if transcript:
-                print(f"[UPDATE] {transcript}")
+        def on_message(self, result, **kwargs):
+            global is_finals
+            # Check if the result has the expected structure
+            if not hasattr(result, 'channel') or not hasattr(result.channel, 'alternatives') or not result.channel.alternatives:
+                # Check for KeepAlive message (optional, for debugging)
+                if hasattr(result, 'type') and result.type == 'KeepAlive':
+                     print("(KeepAlive message received from Deepgram)")
+                     return
+                print(f"Warning: Received unexpected message format: {result.to_json()}")
+                return
 
-        # Flux thinks the user may be done; begin speculative reply
-        elif msg_type == "EagerEndOfTurn":
-            transcript = message.get("transcript", "")
-            print(f"\n[EAGER END OF TURN] {transcript}")
+            sentence = result.channel.alternatives[0].transcript
+            if len(sentence) == 0:
+                return
 
-            await cancel_draft_response()
+            if result.is_final:
+                is_finals.append(sentence)
+                if result.speech_final:
+                    utterance = " ".join(is_finals)
+                    print(f"Speech Final: {utterance}")
+                    is_finals = []
+                    pause_sending()  # Pause sending audio after final result
+                    llm_processing = True # Set flag to indicate LLM processing is in progress
+                    #brain.main(utterance)  # Call the main function from brain.py with the final result
+                    llm_processing = False
+                else:
+                    print(f"Is Final: {sentence}")
+            else:
+                print(f"Interim Results: {sentence}")
 
-            current_draft_task = asyncio.create_task(
-                prepare_draft_response(transcript)
-            )
+        def on_metadata(self, metadata, **kwargs):
+            print(f"Metadata: {metadata}")
 
-        # User resumed speaking after eager end of turn
-        elif msg_type == "TurnResumed":
-            print("\n[TURN RESUMED] User kept talking")
-            await cancel_draft_response()
+        def on_speech_started(self, speech_started, **kwargs):
+            print("--- Speech Started ---")
 
-        # Final confirmed end of turn
-        elif msg_type == "EndOfTurn":
-            transcript = message.get("transcript", "")
-            print(f"\n[END OF TURN] {transcript}")
+        def on_utterance_end(self, utterance_end, **kwargs):
+            print("--- Utterance End ---")
+            global is_finals
+            if len(is_finals) > 0:
+                utterance = " ".join(is_finals)
+                print(f"Utterance End Transcript: {utterance}")
+                is_finals = []
+                pause_sending()
+                llm_processing = True # Set flag to indicate LLM processing is in progress
+                brain.main(utterance)
+                llm_processing = False # Reset flag after processing
+            # Pause sending audio after utterance end
 
-            if current_draft_task and not current_draft_task.done():
-                try:
-                    await current_draft_task
-                except asyncio.CancelledError:
-                    pass
+        def on_close(self, close, **kwargs):
+            print(f"\n--- Connection Closed (Code: {close.code}, Reason: {close.reason}) ---")
+            stop_event.set()
 
-            await finalize_response(transcript)
+        def on_error(self, error, **kwargs):
+            print(f"Handled Error: {error}")
+            stop_event.set()
 
-        elif msg_type == "Error":
-            print("[ERROR]", message)
+        def on_unhandled(self, unhandled, **kwargs):
+            print(f"Unhandled Websocket Message: {unhandled}")
+
+        dg_connection.on(LiveTranscriptionEvents.Open, on_open)
+        dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
+        dg_connection.on(LiveTranscriptionEvents.Metadata, on_metadata)
+        dg_connection.on(LiveTranscriptionEvents.SpeechStarted, on_speech_started)
+        dg_connection.on(LiveTranscriptionEvents.UtteranceEnd, on_utterance_end)
+        dg_connection.on(LiveTranscriptionEvents.Close, on_close)
+        dg_connection.on(LiveTranscriptionEvents.Error, on_error)
+        dg_connection.on(LiveTranscriptionEvents.Unhandled, on_unhandled)
+        # --- /Event Handlers ---
+
+
+        # --- Live Transcription Options ---
+        options: LiveOptions = LiveOptions(
+            model="nova-3",
+            language="multi",
+            smart_format=True,
+            encoding="linear16",
+            channels=1,
+            sample_rate=16000,
+            interim_results=True,
+            utterance_end_ms="1000",
+            vad_events=True,
+            endpointing=700,
+        )
+
+        addons = {
+            "no_delay": "true"
+        }
+        # --- /Live Transcription Options ---
+
+
+        # --- Start Connection and Microphone ---
+        print("Attempting to connect to Deepgram...")
+        if dg_connection.start(options, addons=addons) is False:
+            print("Failed to connect to Deepgram")
+            return
+        print("Connection successful.")
+
+        microphone = Microphone(lambda chunk: handle_microphone_data(chunk, dg_connection))
+        microphone.start()
+        print("Microphone started.")
+        pause_sending()  # Start with sending paused
+        while not stop_event.is_set():
+            sleep(0.1)
+
+        # --- /Start Connection and Microphone ---
+
+
+        # --- Wait for Stop Signal ---
+
+    except Exception as e:
+        print(f"An unexpected error occurred in main: {e}")
+        import traceback
+        traceback.print_exc() # Print detailed traceback for debugging
+        stop_event.set() # Ensure stop event is set in case of exception
+
+    finally:
+        # --- Cleanup ---
+        print("Cleaning up resources...")
+
+        # Stop the input thread first if it's still running
+        if input_thread and input_thread.is_alive():
+             print("Signaling input thread to stop...")
+             # No explicit stop needed for daemon thread if stop_event is set,
+             # but joining is good practice.
+             input_thread.join(timeout=1.0) # Wait briefly for it
+             if input_thread.is_alive():
+                  print("Warning: Input thread did not exit cleanly.")
+
+        # Finish microphone
+        if microphone:
+            print("Stopping microphone...")
+            microphone.finish()
+            print("Microphone finished.")
+        else:
+            print("Microphone object not found or already cleaned up.")
+
+        # Finish Deepgram connection
+        if dg_connection:
+            print("Closing Deepgram connection...")
+            dg_connection.finish()
+            print("Deepgram connection finished.")
+        else:
+            print("Deepgram connection object not found or already cleaned up.")
+
+        print("Cleanup complete. Exiting.")
+        # --- /Cleanup ---
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nStopped by user")
-
+    microphone = None
+    dg_connection = None
+    input_thread = threading.Thread(target=handle_input, args=(microphone, dg_connection))
+    input_thread.daemon = True # Make input thread a daemon so it exits if main thread exits
+    input_thread.start()
+    main()
